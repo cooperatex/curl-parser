@@ -2,3 +2,4 @@
 node_modules
 lcov.info
 .idea
+Cargo.lock
