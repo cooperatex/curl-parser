@@ -19,6 +19,7 @@ reqwest = ["dep:reqwest"]
 
 [dependencies]
 base64 = "0.22"
+bytes = "1.7"
 form_urlencoded = "1"
 http = "1.1"
 minijinja = { version = "2.3", features = ["loader", "speedups"] }

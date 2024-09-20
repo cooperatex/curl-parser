@@ -1,4 +1,4 @@
-use crate::{error::*, ParsedRequest};
+use crate::{error::*, ParsedRequest, Request};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use http::{
     header::{HeaderName, ACCEPT, AUTHORIZATION, CONTENT_TYPE},
@@ -98,6 +98,108 @@ fn parse_input(input: &str) -> Result<ParsedRequest> {
     Ok(parsed)
 }
 
+fn parse_input_v2(input: &str) -> Result<Request> {
+    let pairs = CurlParser::parse(Rule::input, input).context(ParseRuleSnafu)?;
+
+    let mut final_method = Method::GET;
+    let mut final_url = http::Uri::default();
+    let mut final_headers = http::header::HeaderMap::default();
+    let mut final_body = bytes::Bytes::default();
+
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::method => {
+                let method = pair.as_str().parse().context(ParseMethodSnafu)?;
+                final_method = method;
+            }
+            Rule::url => {
+                let url = pair.into_inner().as_str();
+
+                // if empty scheme set curl defaults to HTTP
+                let url = if url.contains("://") {
+                    url.parse().context(ParseUrlSnafu)?
+                } else {
+                    format!("http://{url}").parse().context(ParseUrlSnafu)?
+                };
+
+                final_url = url;
+            }
+            Rule::location => {
+                let s = pair
+                    .into_inner()
+                    .next()
+                    .expect("location string must be present")
+                    .as_str();
+                let location = s.parse().context(ParseUrlSnafu)?;
+
+                final_url = location;
+            }
+            Rule::header => {
+                let s = pair
+                    .into_inner()
+                    .next()
+                    .expect("header string must be present")
+                    .as_str();
+                let mut kv = s.splitn(2, ':');
+                let name = kv.next().expect("key must present").trim();
+                let value = kv.next().expect("value must present").trim();
+                final_headers.insert(
+                    HeaderName::from_str(name).context(ParseHeaderNameSnafu)?,
+                    HeaderValue::from_str(value).context(ParseHeaderValueSnafu)?,
+                );
+            }
+            Rule::auth => {
+                let s = pair
+                    .into_inner()
+                    .next()
+                    .expect("header string must be present")
+                    .as_str();
+                let basic_auth = format!("Basic {}", STANDARD.encode(s.as_bytes()));
+                final_headers.insert(
+                    AUTHORIZATION,
+                    basic_auth.parse().context(ParseHeaderValueSnafu)?,
+                );
+            }
+            Rule::body => {
+                let s = pair.as_str().trim();
+                let s = remove_quote(s);
+
+                final_body = bytes::Bytes::copy_from_slice(s.as_bytes());
+            }
+            Rule::EOI => break,
+            _ => unreachable!("Unexpected rule: {:?}", pair.as_rule()),
+        }
+    }
+
+    if final_headers.get(CONTENT_TYPE).is_none() && !final_body.is_empty() {
+        final_headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+    }
+    if final_headers.get(ACCEPT).is_none() {
+        final_headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    }
+    if !final_body.is_empty() && final_method == Method::GET {
+        final_method = Method::POST
+    }
+
+    let mut request_builder = http::request::Request::builder()
+        .method(final_method)
+        .uri(final_url);
+
+    for (k, v) in final_headers {
+        if let Some(k) = k {
+            request_builder = request_builder.header(k, v);
+        }
+    }
+
+    let http_request = request_builder
+        .body(final_body)
+        .context(BuildHttpRequestSnafu)?;
+    Ok(http_request.into())
+}
+
 impl ParsedRequest {
     pub fn load(input: &str, context: Option<impl Serialize>) -> Result<Self> {
         if let Some(context) = context {
@@ -132,6 +234,22 @@ impl ParsedRequest {
             encoded.append_pair(remove_quote(key), remove_quote(value));
         }
         encoded.finish()
+    }
+}
+
+impl Request {
+    pub fn load(input: &str, context: Option<impl Serialize>) -> Result<Self> {
+        if let Some(context) = context {
+            let env = Environment::new();
+            let input = env.render_str(input, context).context(RenderSnafu)?;
+            parse_input_v2(&input)
+        } else {
+            parse_input_v2(input)
+        }
+    }
+
+    pub fn body(&mut self) -> &bytes::Bytes {
+        self.0.body()
     }
 }
 
